@@ -1,0 +1,154 @@
+---
+title: "Predicting Weight Lifting Exercise Using Body Sensor Data"
+output: html_document
+---
+
+### Summary
+
+This analysis uses a random forest to predict the type of exercise being done based on a large number of numeric variables measured by body sensors during the exercise.  There are five types of exercise involving a dumbbell biceps curl; the first is done properly and the other four are all intentional mistakes.  The classes are: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).  
+
+***
+
+### Data Processing
+
+The raw data contained 19622 observations and 160 variables.  The first seven variables, such as subject name and timestamps, did not seem relevant for prediction and were deleted.  Also, many variables were missing for about 98% of observations, so I deleted those also.  That left 52 predictor variables which measured various motions of the arm, forearm, belt, and dumbbell.  
+
+```{r data_setup, results="hide", warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(dplyr)
+library(parallel)
+library(doParallel)
+library(randomForest)
+
+setwd('H:\\Courses\\Coursera\\Prediction')
+
+# download and read input data
+train.data.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+train.file.name <- "pml-training.csv"
+#download.file(train.data.url, train.file.name)
+pml.data.raw <- read.csv(train.file.name, na.strings = c("NA",""))
+
+# delete first seven variables; they don't seem relevant for prediction
+pml.data.raw %>%
+    select(-(1:7)) -> pml.data
+
+# a bunch of variables are missing 98% of values.  delete them.
+na.lower.10 <- function(x) {
+    (sum(is.na(x)) / length(x)) < 0.1
+}
+pml.data <- pml.data[, vapply(pml.data, na.lower.10, logical(1)), drop=F]
+
+# create a standardized data frame  [column 53 is the categorical outcome variable]
+#preObj <- preProcess(pml.data[,-53], method=c("center","scale"))
+#standard.data <- data.frame(predict(preObj, pml.data[,-53]), classe = pml.data[,53])
+
+# pca
+#preProc <- preProcess(pml.data[,-53], method="pca", thresh = 0.9)
+
+# create training and test sets
+inTrain <- createDataPartition(pml.data$classe, p=0.75, list=FALSE)
+training.data <- pml.data[inTrain,]
+holdout.data <- pml.data[-inTrain,]
+```
+
+***
+
+### Model Parameters
+
+I used a random forest as a prediction algorithm because it does not assume any particular structure or model, and can identify complex interactions which are possible given the large number of variables.  In a random forest, a prespecified number of trees are created, each with a bootstrapped sample of the original data.  Within each tree, a random sample of variables is considered for splitting the branches.  The final prediction for an observation is the class most commonly selected out of all the trees in the forest.  
+
+Due to the large number of variables and observations, running a random forest is computationally intensive.  I experimented with several model parameters to attempt to find inputs that would run in a few minutes, but not sacrifice too much predictive accuracy.  That included:  
+
+1. Implementing parallel processing as described [here](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md).  
+2. Using 5-fold cross validation to select the optimal number of variables to sample within each tree.  Nine seemed about optimal, but anything between 5-15 gave similar predictive accuracy.  
+3. Growing 80 trees instead of the default of 500 also seemed to give similar predictive accuracy.  
+4. I used about 3/4 of the data as a training sample (anything higher caused memory errors).  But leaving 1/4 of the data out allows estimation of out-of-sample errors.  
+
+***
+
+### Model Accuracy
+
+A summary of the predictive accuracy on the training set is shown below.  All classes were predicted with around 99% accuracy or better.  The out-of-bag error estimate was 0.61%.  
+
+```{r, cache=TRUE}
+
+set.seed(312)
+
+# use parallel processing to shorten execution time
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+# use cross-validation instead of bootstrapping to estimate test performance accuracy
+# this will also be faster
+fitControl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+
+# mtry: number of variables randomly sampled as candidates at each split
+rf_grid <- expand.grid(mtry = c(9))
+
+# random forest algorithm
+# running the random forest on the entire sample causes memory errors
+# the best I can do is use a training sample of about 3/4 of the data
+# this still predicts with > 99% accuracy
+modFit <- train(classe ~ ., 
+                data=training.data, 
+                method="rf", 
+                trControl = fitControl, 
+                prox=TRUE, 
+                ntree=80, 
+                tuneGrid = rf_grid)
+
+# turn off parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+
+# model diagnostics
+#modFit
+modFit$finalModel
+#modFit$resample
+#confusionMatrix.train(modFit)
+
+```
+
+***
+
+### Out of Sample Error
+
+Out of sample error was estimated using the 1/4 of data not used to build the model.  If the model were overfit, we would expect the accuracy to be noticeably lower than the model predictions on the training set.  In this case, the accuracy was 0.9935 (error 0.0065), about what was indicated by the OOB estimate above.  Sensitivity and specificity for each class were around 98-99%.  
+
+```{r}
+holdout.predictions <- predict(modFit$finalModel, newdata=holdout.data)
+confusionMatrix(holdout.predictions, holdout.data$classe)
+```
+
+***
+
+### Variable Importance  
+
+The ability of each variable to separate observations into classes is shown in the plot below.  It appears that belt roll and yaw were most important.  This information could be useful to physical trainers to help determine exactly which motions are associated with poor weightlifting form.  
+
+```{r, fig.height = 6}
+varImpPlot(modFit$finalModel, main = "Relative Importance of Variables in Final Model")
+```
+
+
+```{r, include = FALSE}
+
+### Predict Test Set Observations ###
+
+# download/load test data
+test.data.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+test.file.name <- "pml-testing.csv"
+#download.file(test.data.url, test.file.name)
+test.data.raw <- read.csv(test.file.name, na.strings = c("NA", NA))
+
+# select same variables as training set
+test.data.raw %>%
+    select(-(1:7)) -> test.data
+test.data <- test.data[, vapply(test.data, na.lower.10, logical(1)), drop=F]
+
+test.predictions <- predict(modFit$finalModel, newdata=test.data)
+test.predictions
+```
+
